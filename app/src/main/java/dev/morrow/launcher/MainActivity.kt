@@ -15,19 +15,25 @@ import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.inputmethod.EditorInfo
+import android.widget.AbsListView
+import android.widget.BaseAdapter
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.GridView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import android.text.Editable
 import android.text.TextWatcher
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executors
 
 private data class LaunchableApp(
     val packageName: String,
@@ -85,9 +91,17 @@ class MainActivity : Activity() {
 
     private var showingLibrary = false
     private var clockView: TextView? = null
-    private var libraryGrid: LinearLayout? = null
+    private var libraryGrid: GridView? = null
+    private var libraryAdapter: AppGridAdapter? = null
     private var libraryCount: TextView? = null
+    private var libraryQuery = ""
+    private var filterRunnable: Runnable? = null
+    private var filterGeneration = 0
+    private var appsLoaded = false
+    private var appsLoading = false
     private var allApps: List<LaunchableApp> = emptyList()
+    private val appExecutor = Executors.newSingleThreadExecutor()
+    private val favoritePackagesKey = "favorite_packages"
 
     private val clockTick = object : Runnable {
         override fun run() {
@@ -99,21 +113,28 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        allApps = loadApps()
         renderHome()
+        refreshApps()
     }
 
     override fun onResume() {
         super.onResume()
-        allApps = loadApps()
         clockView?.text = currentTime()
         handler.removeCallbacks(clockTick)
         handler.post(clockTick)
+        if (!appsLoaded) refreshApps()
     }
 
     override fun onPause() {
         handler.removeCallbacks(clockTick)
         super.onPause()
+    }
+
+    override fun onDestroy() {
+        handler.removeCallbacks(clockTick)
+        filterRunnable?.let(handler::removeCallbacks)
+        appExecutor.shutdownNow()
+        super.onDestroy()
     }
 
     @Deprecated("Deprecated in Android 13, retained for compatibility with older devices")
@@ -220,28 +241,57 @@ class MainActivity : Activity() {
         configureWindow(this)
     }
 
-    private fun loadApps(): List<LaunchableApp> {
+    // Package queries and icon decoding can be expensive on devices with large app libraries.
+    // Keep all of that work off the main thread.
+    private fun queryApps(): List<LaunchableApp> {
         val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         return packageManager.queryIntentActivities(intent, 0)
             .mapNotNull { resolve ->
-                val info = resolve.activityInfo ?: return@mapNotNull null
-                if (info.packageName == packageName) return@mapNotNull null
-                val appInfo: ApplicationInfo = info.applicationInfo ?: return@mapNotNull null
-                LaunchableApp(
-                    packageName = info.packageName,
-                    label = appInfo.loadLabel(packageManager).toString(),
-                    icon = appInfo.loadIcon(packageManager)
-                )
+                try {
+                    val info = resolve.activityInfo ?: return@mapNotNull null
+                    if (info.packageName == packageName) return@mapNotNull null
+                    val appInfo: ApplicationInfo = info.applicationInfo ?: return@mapNotNull null
+                    LaunchableApp(
+                        packageName = info.packageName,
+                        label = appInfo.loadLabel(packageManager).toString(),
+                        icon = appInfo.loadIcon(packageManager)
+                    )
+                } catch (_: Exception) {
+                    null
+                }
             }
             .distinctBy { it.packageName }
             .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.label })
     }
 
+    private fun refreshApps() {
+        if (appsLoading || isFinishing) return
+        appsLoading = true
+        appExecutor.execute {
+            val loaded = try {
+                queryApps()
+            } catch (_: Exception) {
+                emptyList()
+            }
+            runOnUiThread {
+                appsLoading = false
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                allApps = loaded
+                appsLoaded = true
+                if (showingLibrary) {
+                    populateLibrary(libraryQuery)
+                } else {
+                    renderHome()
+                }
+            }
+        }
+    }
+
     private fun renderHome() {
         showingLibrary = false
         libraryGrid = null
+        libraryAdapter = null
         libraryCount = null
-        allApps = loadApps()
 
         val root = newRoot()
         val scroll = ScrollView(this).apply {
@@ -313,6 +363,11 @@ class MainActivity : Activity() {
         }
         section.addView(text("YOUR SHORTCUTS", 11f, palette.ink, true, 0.12f))
         section.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        section.addView(text("EDIT", 9f, palette.accent, true, 0.08f).apply {
+            setPadding(dp(10), dp(8), dp(8), dp(8))
+            isClickable = true
+            setOnClickListener { showShortcutPicker() }
+        })
         val shortcutCount = preferredApps().size.coerceAtMost(4)
         section.addView(text("$shortcutCount PINNED", 9f, palette.muted, true, 0.08f))
         page.addView(section)
@@ -381,22 +436,81 @@ class MainActivity : Activity() {
 
     private fun preferredApps(): List<LaunchableApp> {
         val byPackage = allApps.associateBy { it.packageName }
-        val preferred = listOf(
-            "com.google.android.dialer",
-            "com.android.dialer",
-            "com.google.android.apps.messaging",
-            "com.android.messaging",
-            "com.android.chrome",
-            "com.google.android.apps.maps",
-            "com.android.camera2",
-            "com.google.android.contacts"
-        )
-        val chosen = preferred.mapNotNull { byPackage[it] }.distinctBy { it.packageName }.take(4)
-        return if (chosen.size >= 4) chosen else {
-            (chosen + allApps.filterNot { app -> chosen.any { it.packageName == app.packageName } })
-                .distinctBy { it.packageName }
+
+        if (preferences.contains(favoritePackagesKey)) {
+            return preferences.getString(favoritePackagesKey, "")
+                .orEmpty()
+                .split("|")
+                .filter { it.isNotBlank() }
+                .mapNotNull { byPackage[it] }
                 .take(4)
         }
+
+        // Automatic suggestions recognise common Google, AOSP and Samsung package names.
+        val preferredPackages = listOf(
+            "com.google.android.dialer",
+            "com.android.dialer",
+            "com.samsung.android.dialer",
+            "com.google.android.apps.messaging",
+            "com.android.messaging",
+            "com.samsung.android.messaging",
+            "com.android.chrome",
+            "com.google.android.apps.maps",
+            "com.google.android.GoogleCamera",
+            "com.sec.android.app.camera",
+            "com.android.camera2",
+            "com.google.android.contacts",
+            "com.android.contacts",
+            "com.samsung.android.contacts"
+        )
+        val chosen = preferredPackages.mapNotNull { byPackage[it] }
+            .distinctBy { it.packageName }
+            .take(4)
+
+        return (chosen + allApps.filterNot { app ->
+            chosen.any { it.packageName == app.packageName }
+        }).distinctBy { it.packageName }.take(4)
+    }
+
+    private fun showShortcutPicker() {
+        if (!appsLoaded) {
+            Toast.makeText(this, "Your apps are still loading. Try again in a moment.", Toast.LENGTH_SHORT).show()
+            refreshApps()
+            return
+        }
+        if (allApps.isEmpty()) return
+
+        val current = preferredApps()
+        val selected = linkedSetOf<String>().apply {
+            current.forEach { add(it.packageName) }
+        }
+        val labels = allApps.map { it.label }.toTypedArray()
+        val checked = allApps.map { it.packageName in selected }.toBooleanArray()
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Choose up to four shortcuts")
+            .setMultiChoiceItems(labels, checked) { dialogInterface, which, isChecked ->
+                val packageName = allApps[which].packageName
+                if (isChecked) {
+                    if (selected.size >= 4) {
+                        (dialogInterface as? AlertDialog)?.listView?.setItemChecked(which, false)
+                        Toast.makeText(this, "Morrow keeps four home shortcuts.", Toast.LENGTH_SHORT).show()
+                    } else {
+                        selected.add(packageName)
+                    }
+                } else {
+                    selected.remove(packageName)
+                }
+            }
+            .setPositiveButton("SAVE") { _, _ ->
+                preferences.edit()
+                    .putString(favoritePackagesKey, selected.joinToString("|"))
+                    .apply()
+                renderHome()
+            }
+            .setNegativeButton("CANCEL", null)
+            .create()
+        dialog.show()
     }
 
     private fun createHomeShortcut(app: LaunchableApp): View {
@@ -449,7 +563,7 @@ class MainActivity : Activity() {
 
     private fun showLibrary() {
         showingLibrary = true
-        allApps = loadApps()
+        libraryQuery = ""
 
         val root = newRoot()
         val page = LinearLayout(this).apply {
@@ -505,15 +619,22 @@ class MainActivity : Activity() {
         page.addView(countRow)
         page.addView(spacer(12))
 
-        val scroll = ScrollView(this).apply {
+        libraryAdapter = AppGridAdapter()
+        val appGrid = GridView(this).apply {
+            numColumns = 3
+            horizontalSpacing = dp(7)
+            verticalSpacing = dp(8)
+            stretchMode = GridView.STRETCH_COLUMN_WIDTH
+            adapter = libraryAdapter
+            isFastScrollEnabled = true
             isVerticalScrollBarEnabled = false
+            setSmoothScrollbarEnabled(true)
             clipToPadding = false
+            setPadding(0, 0, 0, dp(12))
+            overScrollMode = View.OVER_SCROLL_NEVER
         }
-        libraryGrid = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-        scroll.addView(libraryGrid, FrameLayout.LayoutParams(-1, -2))
-        page.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        libraryGrid = appGrid
+        page.addView(appGrid, LinearLayout.LayoutParams(-1, 0, 1f))
 
         search.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
@@ -530,58 +651,106 @@ class MainActivity : Activity() {
     }
 
     private fun populateLibrary(query: String) {
-        val grid = libraryGrid ?: return
-        val filtered = allApps.filter { it.label.contains(query.trim(), ignoreCase = true) }
-        grid.removeAllViews()
-        libraryCount?.text = "${filtered.size} APPS"
-
-        if (filtered.isEmpty()) {
-            grid.addView(text("No apps found. Try another search.", 13f, palette.muted).apply {
-                gravity = Gravity.CENTER
-                setPadding(0, dp(34), 0, dp(34))
-            })
+        libraryQuery = query
+        val adapter = libraryAdapter ?: return
+        if (!appsLoaded) {
+            libraryCount?.text = "LOADING…"
             return
         }
 
-        filtered.chunked(3).forEach { rowApps ->
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.TOP
+        filterRunnable?.let(handler::removeCallbacks)
+        val generation = ++filterGeneration
+        val querySnapshot = query.trim()
+        val appsSnapshot = allApps
+        libraryCount?.text = "FILTERING…"
+
+        val task = Runnable {
+            appExecutor.execute {
+                val filtered = appsSnapshot.filter {
+                    it.label.contains(querySnapshot, ignoreCase = true)
+                }
+                runOnUiThread {
+                    if (!isDestroyed &&
+                        showingLibrary &&
+                        generation == filterGeneration &&
+                        libraryQuery.trim() == querySnapshot
+                    ) {
+                        libraryCount?.text = "${filtered.size} APPS"
+                        adapter.submitItems(filtered)
+                    }
+                }
             }
-            rowApps.forEach { app ->
-                row.addView(createLibraryApp(app), LinearLayout.LayoutParams(0, dp(112), 1f).apply {
-                    rightMargin = dp(5)
-                    bottomMargin = dp(8)
-                })
+        }
+        filterRunnable = task
+        handler.postDelayed(task, 100L)
+    }
+
+    private inner class AppGridAdapter : BaseAdapter() {
+        private var items: List<LaunchableApp> = emptyList()
+
+        override fun getCount(): Int = items.size
+
+        override fun getItem(position: Int): LaunchableApp = items[position]
+
+        override fun getItemId(position: Int): Long = position.toLong()
+
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+            val tile: LinearLayout
+            val views: AppTileViews
+
+            if (convertView == null) {
+                tile = LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    gravity = Gravity.CENTER
+                    background = rounded(palette.surface, 19, palette.line, 1)
+                    isClickable = true
+                    isFocusable = true
+                    setPadding(dp(5), dp(10), dp(5), dp(8))
+                    layoutParams = AbsListView.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        dp(112)
+                    )
+                }
+                val iconView = ImageView(this@MainActivity).apply {
+                    scaleType = ImageView.ScaleType.FIT_CENTER
+                }
+                val labelView = text("", 11f, palette.ink, true).apply {
+                    gravity = Gravity.CENTER
+                    maxLines = 1
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                    setPadding(dp(3), dp(8), dp(3), 0)
+                }
+                tile.addView(iconView, LinearLayout.LayoutParams(dp(43), dp(43)))
+                tile.addView(labelView, LinearLayout.LayoutParams(-1, -2))
+                views = AppTileViews(iconView, labelView)
+                tile.tag = views
+            } else {
+                tile = convertView as LinearLayout
+                views = tile.tag as AppTileViews
             }
-            repeat(3 - rowApps.size) {
-                row.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
-            }
-            grid.addView(row)
+
+            val app = items[position]
+            views.icon.setImageDrawable(app.icon)
+            views.label.text = app.label
+            tile.contentDescription = "Open ${app.label}"
+            tile.setOnClickListener { onAppSelected(app.packageName) }
+            return tile
+        }
+
+        fun submitItems(next: List<LaunchableApp>) {
+            items = next
+            notifyDataSetChanged()
         }
     }
 
-    private fun createLibraryApp(app: LaunchableApp): View {
-        val tile = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            background = rounded(palette.surface, 19, palette.line, 1)
-            isClickable = true
-            isFocusable = true
-            setOnClickListener { openApp(app) }
-            setPadding(dp(5), dp(10), dp(5), dp(8))
-        }
-        tile.addView(ImageView(this).apply {
-            setImageDrawable(app.icon)
-            scaleType = ImageView.ScaleType.FIT_CENTER
-        }, LinearLayout.LayoutParams(dp(43), dp(43)))
-        tile.addView(text(app.label, 11f, palette.ink, true).apply {
-            gravity = Gravity.CENTER
-            maxLines = 1
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            setPadding(dp(3), dp(8), dp(3), 0)
-        }, LinearLayout.LayoutParams(-1, -2))
-        return tile
+    private data class AppTileViews(
+        val icon: ImageView,
+        val label: TextView
+    )
+
+    private fun onAppSelected(packageName: String) {
+        val app = allApps.firstOrNull { it.packageName == packageName } ?: return
+        openApp(app)
     }
 
     private fun openApp(app: LaunchableApp) {
@@ -611,13 +780,25 @@ class MainActivity : Activity() {
         val themeChoice = if (isDark) "Switch to warm paper" else "Switch to midnight"
         AlertDialog.Builder(this)
             .setTitle("Morrow")
-            .setItems(arrayOf(themeChoice, "About Morrow")) { _, which ->
+            .setItems(
+                arrayOf(
+                    themeChoice,
+                    "Choose home shortcuts",
+                    "Reset shortcuts to automatic",
+                    "About Morrow"
+                )
+            ) { _, which ->
                 when (which) {
                     0 -> {
                         preferences.edit().putBoolean("midnight", !isDark).apply()
                         renderHome()
                     }
-                    1 -> showAbout()
+                    1 -> showShortcutPicker()
+                    2 -> {
+                        preferences.edit().remove(favoritePackagesKey).apply()
+                        renderHome()
+                    }
+                    3 -> showAbout()
                 }
             }
             .setNegativeButton("CLOSE", null)

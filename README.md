@@ -17,10 +17,13 @@ Morrow is an Android home launcher built from scratch with native Kotlin and pla
 - Android HOME / DEFAULT intent handling.
 - Discovers launchable apps installed on the device.
 - Opens apps from a favourites strip or the app library.
-- Search filters the app library as you type.
+- Search filters the app library as you type, with filtering performed away from the UI thread.
+- The app library uses a recycling grid, so only visible app tiles need to be drawn.
+- App discovery and icon loading run in the background.
+- Choose and save up to four home-screen shortcuts, or reset to automatic suggestions.
 - Live clock and localised date.
 - Warm-paper and midnight appearance modes.
-- Remembers the selected appearance locally.
+- Remembers the selected appearance and shortcut choices locally.
 
 ## Build
 
@@ -50,7 +53,7 @@ Then open **Morrow Launcher** and choose it as your Home app when Android asks, 
 
 ## Project shape
 
-This is an intentionally small first release. The UI is built with Android platform views, so the project does not depend on a UI framework or a third-party launcher base. Widgets, icon packs, gesture customisation, and backup/restore are not implemented yet.
+This is an intentionally small early release. The UI is built with Android platform views, so the project does not depend on a UI framework or a third-party launcher base. Widgets, icon packs, gesture customisation, and backup/restore are not implemented yet.
 
 ## License
 
