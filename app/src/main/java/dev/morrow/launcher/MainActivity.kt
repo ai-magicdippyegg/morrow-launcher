@@ -178,6 +178,10 @@ class MainActivity : Activity() {
     }
 
     private fun configureWindow(root: View) {
+        // Access decorView first: PhoneWindow's insetsController is unavailable until
+        // its decor has been installed. This activity builds its content programmatically.
+        val decor = window.decorView
+
         window.statusBarColor = palette.background
         window.navigationBarColor = palette.background
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -186,7 +190,7 @@ class MainActivity : Activity() {
                 android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
                     android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
             }
-            window.insetsController?.setSystemBarsAppearance(
+            decor.windowInsetsController?.setSystemBarsAppearance(
                 light,
                 android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
                     android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
