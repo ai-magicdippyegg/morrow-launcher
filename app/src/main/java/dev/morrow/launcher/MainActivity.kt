@@ -480,7 +480,7 @@ class MainActivity : Activity() {
         val search = EditText(this).apply {
             hint = "Find an app"
             textSize = 14f
-            singleLine = true
+            isSingleLine = true
             imeOptions = EditorInfo.IME_ACTION_SEARCH
             setTextColor(palette.ink)
             setHintTextColor(palette.muted)
@@ -508,7 +508,7 @@ class MainActivity : Activity() {
         libraryGrid = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
-        scroll.addView(libraryGrid, ScrollView.LayoutParams(-1, -2))
+        scroll.addView(libraryGrid, FrameLayout.LayoutParams(-1, -2))
         page.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
         search.addTextChangedListener(object : TextWatcher {
